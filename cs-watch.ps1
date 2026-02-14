@@ -41,8 +41,47 @@
 #>
 param(
     [string]$Path = (Get-Location),   # Default to the current directory if no path is provided
-    [string]$FileFilter = '*.php'     # Default to *.php if no file filter is provided
+    [string]$FileFilter = '*'     # Default to *.php if no file filter is provided
 )
+
+
+# Waits until a file stops changing before processing it.
+# NetBeans and other IDEs save files through multiple rapid write/rename operations,
+# which trigger several FileSystemWatcher events. This function checks that the file's
+# size and LastWriteTime remain unchanged for a short period, ensuring the save
+# operation is fully completed before continuing.
+function global:Wait-FileStable {
+    param(
+        [string]$Path,
+        [int]$StableMilliseconds = 500
+    )
+
+    $lastSize = -1
+    $lastWrite = Get-Date
+
+    while ($true) {
+        if (-not (Test-Path $Path)) {
+            Start-Sleep -Milliseconds 100
+            continue
+        }
+
+        $info = Get-Item $Path
+        $size = $info.Length
+        $write = $info.LastWriteTime
+
+        if ($size -eq $lastSize -and $write -eq $lastWrite) {
+            Start-Sleep -Milliseconds $StableMilliseconds
+            $info2 = Get-Item $Path
+            if ($info2.Length -eq $size -and $info2.LastWriteTime -eq $write) {
+                return
+            }
+        }
+
+        $lastSize = $size
+        $lastWrite = $write
+        Start-Sleep -Milliseconds 100
+    }
+}
 
 
 # Specify whether you want to monitor subfolders as well:
@@ -53,9 +92,11 @@ $AttributeFilter = [IO.NotifyFilters]::FileName, [IO.NotifyFilters]::LastWrite
 
 # Global debounce table and timeout
 $global:LastChanged = @{}  # Initialize the global variable for LastChanged
-$global:DebounceSeconds = 10  # Initialize the global variable for DebounceSeconds
+$global:DebounceSeconds = 1  # Initialize the global variable for DebounceSeconds
+$global:Cooldown = @{}
 
 try {
+
     $watcher = New-Object -TypeName System.IO.FileSystemWatcher -Property @{
         Path = $Path
         Filter = $FileFilter
@@ -70,6 +111,15 @@ try {
         $FullPath = $details.FullPath
         $ChangeType = $details.ChangeType
         $Timestamp = $event.TimeGenerated
+		
+		# Cooldown per evitare loop con IDE
+		if ($global:Cooldown.ContainsKey($FullPath)) {
+			$last = $global:Cooldown[$FullPath]
+			if ((Get-Date) -lt $last) {
+				Write-Host "Cooldown attivo, ignoro: $FullPath" -ForegroundColor Gray
+				return
+			}
+		}
 
         Write-Host "$FullPath was $ChangeType at $Timestamp" -ForegroundColor DarkYellow
 
@@ -87,16 +137,54 @@ try {
         $global:LastChanged[$FullPath] = $now
 
         try {
-            # Run phpcbf command on the changed file
-            Write-Host "Running phpcbf on: $FullPath"
-            $proc = Start-Process -FilePath "phpcbf" -ArgumentList "-s $FullPath" -NoNewWindow -PassThru -Wait
-			$proc.WaitForExit()  # Ensure the script waits until the process finishes
+			
+			# Determine extension
+			$ext = [System.IO.Path]::GetExtension($FullPath).ToLower()
+
+			# List of PHP extensions
+			$phpExtensions = @(".php", ".phtml", ".inc", ".module", ".install")
+
+			# Ignore files that have no formatter
+			if (($phpExtensions -notcontains $ext) -and ($ext -ne ".js")) {
+				Write-Host "Ignoring file (no formatter configured): $FullPath" -ForegroundColor Gray
+				return
+			}
+
+			# Wait for file stability once
+			Write-Host "Waiting for file to become stable..."
+			Wait-FileStable -Path $FullPath -StableMilliseconds 1000
+
+			if ($phpExtensions -contains $ext) {
+				Write-Host "Running phpcbf on: $FullPath"
+				Start-Process -FilePath "phpcbf" -ArgumentList "-s $FullPath" -NoNewWindow -Wait
+				$global:Cooldown[$FullPath] = (Get-Date).AddSeconds(1)
+
+			}
+			elseif ($ext -eq ".js") {
+				Write-Host "Running eslint --fix on: $FullPath"
+
+				$projectDir = Split-Path $FullPath -Parent
+				$localEslint = Join-Path $projectDir "node_modules\.bin\eslint.cmd"
+
+				if (Test-Path $localEslint) {
+					$eslint = $localEslint
+				} else {
+					$eslint = Join-Path $env:APPDATA "npm\eslint.cmd"
+				}
+
+				Start-Process -FilePath $eslint `
+					-ArgumentList "--fix `"$FullPath`"" `
+					-WorkingDirectory $projectDir `
+					-NoNewWindow -Wait
+				
+				$global:Cooldown[$FullPath] = (Get-Date).AddSeconds(1)
+			}
 
             # Wait some time (optional)
-            Start-Sleep -Seconds 5
+            #Start-Sleep -Seconds 5
 
         } catch {
-            Write-Host "Error running phpcbf: $_" -ForegroundColor Red
+            Write-Host "Error running formatter: $_" -ForegroundColor Red
         }
     }
 
